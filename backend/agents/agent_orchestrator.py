@@ -315,6 +315,7 @@ class BaseAgent:
                         "agent_type": self.agent_type.value,
                         "tool_name": name,
                         "tool_use_id": tool_use_id,
+                        "input": dict(args),
                         "success": call_success,
                         "result_success": result_success,
                         "latency_ms": round(tool_latency_ms, 1),
@@ -900,11 +901,22 @@ class AgentOrchestrator:
 
         ordered = sorted(available_scores.items(), key=lambda item: item[1], reverse=True)
         primary_agent, primary_score = ordered[0]
+
+        collaboration_targets = self._collaboration_targets(req)
         supporting_agents = [
             agent_type
-            for agent_type, score in ordered[1:]
-            if agent_type != AgentType.GENERAL and score >= 0.45 and score >= primary_score * 0.55
+            for agent_type in collaboration_targets
+            if agent_type != primary_agent and agent_type in available_scores
         ]
+
+        if not supporting_agents:
+            supporting_agents = [
+                agent_type
+                for agent_type, score in ordered[1:]
+                if agent_type != AgentType.GENERAL
+                and score >= 0.45
+                and score >= primary_score * 0.55
+            ]
 
         reason = self._routing_reason(req, available_scores, primary_agent, supporting_agents)
         return RoutingDecision(
