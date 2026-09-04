@@ -1,0 +1,88 @@
+{
+  "accounts": [
+    {
+      "user_id": "u1001",
+      "display_name": "演示客户甲",
+      "account_id": "DEMO-1001",
+      "phone_masked": "138****1001",
+      "status": "正常（模拟）",
+      "risk_assessment": {
+        "level": "C2",
+        "assessed_at": "2026-09-15",
+        "expires_at": "2027-09-14",
+        "source": "模拟正式测评记录；不可由聊天偏好更新"
+      }
+    },
+    {
+      "user_id": "u1002",
+      "display_name": "演示客户乙",
+      "account_id": "DEMO-1002",
+      "phone_masked": "139****1002",
+      "status": "待人工核验（模拟）",
+      "risk_assessment": null
+    }
+  ],
+  "transactions": [
+    {
+      "transaction_id": "TX1001",
+      "user_id": "u1001",
+      "product_id": "EM002",
+      "kind": "赎回",
+      "amount": "10000.00",
+      "currency": "CNY",
+      "status": "已确认，待到账",
+      "submitted_at": "2026-10-02T14:20:00+08:00",
+      "confirmed_at": "2026-10-05T10:00:00+08:00",
+      "estimated_settlement": "2026-10-07（模拟日历，非真实交易日历）",
+      "as_of": "2026-10-05T10:00:00+08:00",
+      "note": "固定业务快照；不会随真实日期自动推进。金额为模拟确认金额。"
+    },
+    {
+      "transaction_id": "TX1002",
+      "user_id": "u1001",
+      "product_id": "EM001",
+      "kind": "申购",
+      "amount": "2000.00",
+      "currency": "CNY",
+      "status": "已受理，待确认",
+      "submitted_at": "2026-10-05T11:00:00+08:00",
+      "as_of": "2026-10-05T11:00:00+08:00",
+      "note": "固定业务快照；已扣款不等于已确认份额。"
+    },
+    {
+      "transaction_id": "TX2001",
+      "user_id": "u1002",
+      "product_id": "EM003",
+      "kind": "申购",
+      "amount": "5000.00",
+      "currency": "CNY",
+      "status": "核验中",
+      "submitted_at": "2026-10-02T10:00:00+08:00",
+      "as_of": "2026-10-05T10:00:00+08:00",
+      "note": "属于另一演示客户，用于验证归属限制。"
+    }
+  ],
+  "payments": [
+    {
+      "payment_id": "PAY1001",
+      "user_id": "u1001",
+      "transaction_id": "TX1002",
+      "amount": "2000.00",
+      "currency": "CNY",
+      "status": "支付成功，申购待确认",
+      "channel": "模拟银行卡 ****1001",
+      "as_of": "2026-10-05T11:00:00+08:00",
+      "note": "记录中仅有一笔已入账扣款；不能据此否定其他渠道的重复扣款，争议需人工核验。"
+    },
+    {
+      "payment_id": "PAY2001",
+      "user_id": "u1002",
+      "transaction_id": "TX2001",
+      "amount": "5000.00",
+      "currency": "CNY",
+      "status": "待核验",
+      "channel": "模拟银行卡 ****2001",
+      "as_of": "2026-10-05T10:00:00+08:00"
+    }
+  ]
+}

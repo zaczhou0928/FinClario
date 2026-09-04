@@ -1,0 +1,96 @@
+[
+  {
+    "source_type": "simulation",
+    "version": "2026-10-v1",
+    "effective_from": "2026-10-01",
+    "effective_to": "2027-09-30",
+    "source": "FinClario 模拟产品说明书（非真实发行产品）",
+    "currency": "CNY",
+    "product_id": "EM001",
+    "name": "清泉货币基金（模拟）",
+    "product_type": "货币基金",
+    "risk_level": "R1（模拟分级）",
+    "description": "主要模拟投资短期货币市场工具；低风险不等于无风险，也不保证本金。",
+    "subscription_rate": "0",
+    "redemption_rates": [
+      {
+        "min_days": 0,
+        "rate": "0"
+      }
+    ],
+    "management_rate": "0.003",
+    "custody_rate": "0.0005",
+    "sales_service_rate": "0.002",
+    "opening": "模拟开放日 09:00—15:00；15:00 后顺延至下一开放日。",
+    "confirmation": "申购及赎回按模拟 T+1 开放日确认。",
+    "settlement": "普通赎回预计确认后 1—2 个开放日到账；不支持快速赎回。"
+  },
+  {
+    "source_type": "simulation",
+    "version": "2026-10-v1",
+    "effective_from": "2026-10-01",
+    "effective_to": "2027-09-30",
+    "source": "FinClario 模拟产品说明书（非真实发行产品）",
+    "currency": "CNY",
+    "product_id": "EM002",
+    "name": "安澜债券基金 A（模拟）",
+    "product_type": "债券基金",
+    "risk_level": "R2（模拟分级）",
+    "description": "主要模拟投资债券，存在利率、信用和流动性风险，净值可能下跌。",
+    "subscription_rate": "0.003",
+    "redemption_rates": [
+      {
+        "min_days": 0,
+        "rate": "0.015"
+      },
+      {
+        "min_days": 7,
+        "rate": "0.001"
+      },
+      {
+        "min_days": 30,
+        "rate": "0"
+      }
+    ],
+    "management_rate": "0.003",
+    "custody_rate": "0.001",
+    "sales_service_rate": "0",
+    "opening": "模拟开放日 09:00—15:00；15:00 后顺延。无封闭期。",
+    "confirmation": "申购和赎回按模拟 T+1 开放日确认。",
+    "settlement": "普通赎回预计 T+3 开放日到账；异常核验可能延迟。"
+  },
+  {
+    "source_type": "simulation",
+    "version": "2026-10-v1",
+    "effective_from": "2026-10-01",
+    "effective_to": "2027-09-30",
+    "source": "FinClario 模拟产品说明书（非真实发行产品）",
+    "currency": "CNY",
+    "product_id": "EM003",
+    "name": "远帆指数基金 A（模拟）",
+    "product_type": "股票指数基金",
+    "risk_level": "R4（模拟分级）",
+    "description": "模拟跟踪宽基股票指数，存在市场波动、跟踪误差和流动性风险；不提供未来涨跌预测。",
+    "subscription_rate": "0.008",
+    "redemption_rates": [
+      {
+        "min_days": 0,
+        "rate": "0.015"
+      },
+      {
+        "min_days": 7,
+        "rate": "0.005"
+      },
+      {
+        "min_days": 30,
+        "rate": "0"
+      }
+    ],
+    "management_rate": "0.005",
+    "custody_rate": "0.001",
+    "sales_service_rate": "0",
+    "opening": "模拟开放日 09:00—15:00；暂停申赎需查产品公告。",
+    "confirmation": "申购和赎回按模拟 T+1 开放日确认。",
+    "settlement": "普通赎回预计 T+4 开放日到账。"
+  }
+]
