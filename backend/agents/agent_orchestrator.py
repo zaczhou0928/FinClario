@@ -16,6 +16,7 @@
   - Agent 置信度低于阈值 → 自动升级到更高级 Agent 或转人工
 """
 import asyncio
+import re
 import inspect
 import json
 import logging
@@ -40,6 +41,7 @@ from agents.tools import (
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
+from finance.policy import SYSTEM_BOUNDARY, operation_requested, wants_handoff, finalize
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +49,11 @@ logger = logging.getLogger(__name__)
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
 
 class AgentType(Enum):
-    GENERAL   = "general"    # 通用客服
-    TECHNICAL = "technical"  # 技术支持
-    BILLING   = "billing"    # 账单/退款
-    ESCALATION = "escalation" # 人工升级与交接
+    GENERAL = 'general'
+    TECHNICAL = 'technical'
+    BILLING = 'billing'
+    PRODUCT = 'product'
+    ESCALATION = 'escalation'
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,8 @@ class AgentStats:
     success:   int   = 0
     total_ms:  float = 0.0
     monitor_penalty: float = 0.0
+    tool_calls: int = 0
+    tool_results_success: int = 0
 
     @property
     def success_rate(self) -> float:
@@ -122,6 +127,23 @@ class AgentResponse:
 
 
 @dataclass
+class AgentCallResult:
+    """一次 LLM 调用的请求级结果，不在共享 Agent 实例上保存状态。"""
+    content: str
+    tools_used: List[str] = field(default_factory=list)
+    tool_traces: List[Dict[str, Any]] = field(default_factory=list)
+
+
+class AgentCallError(RuntimeError):
+    """保留失败前已经发生的工具调用，供请求 trace 记录。"""
+
+    def __init__(self, message: str, tools_used: List[str], tool_traces: List[Dict[str, Any]]):
+        super().__init__(message)
+        self.tools_used = list(tools_used)
+        self.tool_traces = list(tool_traces)
+
+
+@dataclass
 class Request:
     message:     str
     user_id:     str
@@ -133,7 +155,7 @@ class Request:
     intent_group: Optional[str] = None
     urgency:     Optional[UrgencyLevel]   = None
     intent_confidence: float = 1.0
-    request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    request_id:  str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
 @dataclass
@@ -151,6 +173,7 @@ class OrchestratorResult:
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
     routing_reason: str = ""
     routing_confidence: float = 0.0
+    policy_warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -191,13 +214,13 @@ class BaseAgent:
         self._model  = self.profile.model or model
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
-        self._last_tools_used: List[str] = []
-        self._last_tool_traces: List[Dict[str, Any]] = []
         self._shared_tools: Dict[str, AgentToolSpec] = {}
+        self._business_tools: Dict[str, AgentToolSpec] = {}
+        self._demo_mode = False
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         """返回该角色真实可调用的工具白名单。"""
-        return dict(self._shared_tools)
+        return {**self._shared_tools, **self._business_tools}
 
     def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
         self._shared_tools = dict(tools or {})
@@ -205,36 +228,39 @@ class BaseAgent:
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
-        self._last_tools_used = []
-        self._last_tool_traces = []
         try:
-            content = await self._call_llm(req)
+            call_result = await self._call_demo(req) if self._demo_mode else await self._call_llm(req)
             ms = (time.monotonic() - t0) * 1000
             self.stats.success += 1
             self.stats.total_ms += ms
-            escalate = self._needs_escalation(content)
+            escalate = self._needs_escalation(call_result.content)
             return AgentResponse(
                 agent_type=self.agent_type,
-                content=content,
+                content=call_result.content,
                 success=True,
                 latency_ms=ms,
                 escalate=escalate,
-                tools_used=list(self._last_tools_used),
-                tool_traces=list(self._last_tool_traces),
+                tools_used=call_result.tools_used,
+                tool_traces=call_result.tool_traces,
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
             self.stats.total_ms += ms
-            logger.error(f"{self.agent_type.value} 处理失败: {ex}")
+            cause = ex.__cause__ or ex
+            auth_failed = getattr(cause,"status_code",None) in (401,403)
+            logger.error("%s 模型调用失败: %s status=%s", self.agent_type.value, type(cause).__name__,getattr(cause,"status_code",None))
+            tools_used = ex.tools_used if isinstance(ex, AgentCallError) else []
+            tool_traces = ex.tool_traces if isinstance(ex, AgentCallError) else []
             return AgentResponse(
                 agent_type=self.agent_type,
-                content="抱歉，处理您的请求时出现问题，请稍后重试。",
+                content=("模型服务认证失败，本次未完成业务查询或计算。请由管理员检查模型连接凭证后重试。" if auth_failed else "模型服务暂时不可用，本次未完成回复生成，请稍后重试。"),
                 success=False,
                 latency_ms=ms,
-                tool_traces=list(self._last_tool_traces),
+                tools_used=list(tools_used),
+                tool_traces=list(tool_traces),
             )
 
-    async def _call_llm(self, req: Request) -> str:
+    async def _call_llm(self, req: Request) -> AgentCallResult:
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
@@ -251,89 +277,111 @@ class BaseAgent:
             messages.append({"role": "user", "content": f"[角色输入契约]\n{_clean(role_packet)}"})
             messages.append({"role": "assistant", "content": "好的，我会按照该角色的输入和输出契约处理。"})
         messages.append({"role": "user", "content": _clean(req.message)})
+        from finance.context import resolve_fee_context
+        fee=resolve_fee_context(req.message,req.history)
+        if fee.active:
+            messages[-1]['content'] += '\n[服务端解析的当前费用咨询；只含用户明确字段]\n'+json.dumps(
+                {'slots':fee.slots,'sources':fee.sources,'missing':fee.missing,'errors':fee.errors},ensure_ascii=False)
 
         tools = self.get_tools()
         tools_used: List[str] = []
         tool_traces: List[Dict[str, Any]] = []
-        for _ in range(3):
-            request_kwargs: Dict[str, Any] = {
-                "model": self._model,
-                "max_tokens": self.profile.max_tokens,
-                "temperature": self.profile.temperature,
-                "system": self._build_system_prompt(req),
-                "messages": messages,
-            }
-            if tools:
-                request_kwargs["tools"] = [
-                    {
-                        "name": spec.name,
-                        "description": spec.description,
-                        "input_schema": spec.input_schema,
-                    }
-                    for spec in tools.values()
-                ]
-            resp = await self._client.messages.create(**request_kwargs)
-            tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
-            if not tool_uses:
-                self._last_tools_used = tools_used
-                return extract_text_content(resp.content)
+        try:
+            # 三轮工具执行之后仍给模型一次读取结果并结束回复的机会。
+            for round_index in range(4):
+                request_kwargs: Dict[str, Any] = {
+                    "model": self._model,
+                    "max_tokens": self.profile.max_tokens,
+                    "temperature": self.profile.temperature,
+                    "system": self._build_system_prompt(req),
+                    "messages": messages,
+                }
+                if tools and round_index < 3:
+                    request_kwargs["tools"] = [
+                        {
+                            "name": spec.name,
+                            "description": spec.description,
+                            "input_schema": spec.input_schema,
+                        }
+                        for spec in tools.values()
+                    ]
+                resp = await self._client.messages.create(**request_kwargs)
+                tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
+                if not tool_uses:
+                    return AgentCallResult(
+                        content=extract_text_content(resp.content),
+                        tools_used=list(tools_used),
+                        tool_traces=list(tool_traces),
+                    )
 
-            messages.append({"role": "assistant", "content": resp.content})
-            tool_results = []
-            for block in tool_uses:
-                name = self._block_value(block, "name")
-                tool_use_id = self._block_value(block, "id")
-                args = self._block_value(block, "input") or {}
-                spec = tools.get(name)
-                tool_t0 = time.monotonic()
-                call_success = True
-                result_success: Optional[bool] = None
-                error_text = ""
-                if spec is None:
-                    call_success = False
-                    result: Any = {"success": False, "error": f"工具不在 {self.agent_type.value} Agent 白名单中"}
-                    error_text = result["error"]
-                else:
-                    try:
-                        self._validate_tool_input(spec, args)
-                        result = spec.handler(req, args)
-                        if inspect.isawaitable(result):
-                            result = await result
+                if round_index == 3:
+                    raise AgentCallError('工具预算已用完，请根据已有证据结束回复',tools_used,tool_traces)
+
+                messages.append({"role": "assistant", "content": resp.content})
+                tool_results = []
+                for block in tool_uses:
+                    name = self._block_value(block, "name")
+                    tool_use_id = self._block_value(block, "id")
+                    args = self._block_value(block, "input") or {}
+                    result, trace = await self._invoke_tool(req, name, args, tool_use_id)
+                    tool_traces.append(trace)
+                    if trace['success']:
                         tools_used.append(name)
-                        if isinstance(result, dict) and "success" in result:
-                            result_success = bool(result.get("success"))
-                    except Exception as ex:
-                        call_success = False
-                        logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
-                        error_text = str(ex)
-                        result = {"success": False, "error": error_text}
-                tool_latency_ms = (time.monotonic() - tool_t0) * 1000
-                if not error_text and isinstance(result, dict):
-                    error_text = str(result.get("error", "") or "")
-                tool_traces.append(
-                    {
-                        "agent_type": self.agent_type.value,
-                        "tool_name": name,
+                    tool_results.append({
+                        "type": "tool_result",
                         "tool_use_id": tool_use_id,
-                        "input": dict(args),
-                        "success": call_success,
-                        "result_success": result_success,
-                        "latency_ms": round(tool_latency_ms, 1),
-                        "cached": bool(result.get("cached")) if isinstance(result, dict) else False,
-                        "reranked": bool(result.get("reranked")) if isinstance(result, dict) else False,
-                        "error": error_text,
-                    }
-                )
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": json.dumps(result, ensure_ascii=False),
-                })
-            messages.append({"role": "user", "content": tool_results})
+                        "content": json.dumps(result, ensure_ascii=False),
+                    })
+                messages.append({"role": "user", "content": tool_results})
 
-        self._last_tools_used = tools_used
-        self._last_tool_traces = tool_traces
-        raise RuntimeError(f"{self.agent_type.value} 工具调用超过最大轮数")
+            raise AgentCallError(
+                f"{self.agent_type.value} 工具调用超过最大轮数",
+                tools_used,
+                tool_traces,
+            )
+        except AgentCallError:
+            raise
+        except Exception as ex:
+            raise AgentCallError(str(ex), tools_used, tool_traces) from ex
+
+    async def _invoke_tool(self, req, name, args, tool_use_id):
+        start = time.monotonic()
+        spec = self.get_tools().get(name)
+        success = True
+        try:
+            if spec is None:
+                raise ValueError(f"工具不在 {self.agent_type.value} Agent 白名单中")
+            self._validate_tool_input(spec, args)
+            result = spec.handler(req, args)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as ex:
+            success = False
+            result = {'success':False,'error':str(ex)}
+        self.stats.tool_calls += 1
+        self.stats.tool_results_success += int(success and (result.get('success',True) if isinstance(result,dict) else True))
+        return result, {
+            'agent_type':self.agent_type.value, 'tool_name':name,'tool_use_id':tool_use_id,
+            'input':args if isinstance(args,dict) else {}, 'success':success,
+            'result_success':result.get('success',True) if isinstance(result,dict) else True,
+            'result':result, 'error':result.get('error','') if isinstance(result,dict) else '',
+            'latency_ms':round((time.monotonic()-start)*1000,1),
+            'cached':bool(result.get('cached')) if isinstance(result,dict) else False,
+            'reranked':bool(result.get('reranked')) if isinstance(result,dict) else False,
+        }
+
+    async def _call_demo(self, req):
+        from finance.demo import plan
+        from finance.tools import render_result
+        calls, extra = plan(req,self.agent_type.value)
+        traces=[]; content=[]; used=[]
+        for index,(name,args) in enumerate(calls):
+            result,trace = await self._invoke_tool(req,name,args,f'demo-{index}')
+            traces.append(trace)
+            if trace['success']: used.append(name)
+            content.append(render_result(name,result))
+        if extra: content.append(extra)
+        return AgentCallResult('\n\n'.join(content),used,traces)
 
     @staticmethod
     def _block_type(block: Any) -> Optional[str]:
@@ -362,8 +410,16 @@ class BaseAgent:
         type_map = {"string": str, "number": (int, float), "integer": int, "boolean": bool}
         for key, value in args.items():
             expected = properties.get(key, {}).get("type")
+            if expected in ("integer", "number") and isinstance(value, bool):
+                raise ValueError(f"参数 {key} 不能为布尔值")
             if expected in type_map and not isinstance(value, type_map[expected]):
                 raise ValueError(f"参数 {key} 类型错误，期望 {expected}")
+            rule = properties.get(key,{})
+            if 'enum' in rule and value not in rule['enum']:
+                raise ValueError(f"参数 {key} 不在允许范围")
+            if expected in ('number','integer'):
+                if ('minimum' in rule and value < rule['minimum']) or ('maximum' in rule and value > rule['maximum']):
+                    raise ValueError(f"参数 {key} 超出范围")
 
     def _build_system_prompt(self, req: Request) -> str:
         """把角色契约和动态 Skills 拼入 system prompt。"""
@@ -376,9 +432,9 @@ class BaseAgent:
             f"输出要求：{'；'.join(self.profile.output_contract)}\n"
             f"升级条件：{'；'.join(self.profile.handoff_conditions) or '无，按通用客服规则处理'}\n"
             f"允许的数据/工具范围：{'、'.join(self.profile.tool_scope) or '仅使用当前请求上下文'}\n"
-            "不要声称执行了未提供的查询、修改或退款操作；缺少证据时明确说明需要核验。"
+            "不要声称执行了未提供的查询、修改或资金操作；缺少证据时明确说明需要核验。"
         )
-        base_prompt = f"{self.system_prompt}{profile_prompt}"
+        base_prompt = f"{SYSTEM_BOUNDARY}\n\n{self.system_prompt}{profile_prompt}"
         if self._skill_manager is None:
             return base_prompt
         skill_prompt = self._skill_manager.prompt_for(req.message, self.agent_type.value)
@@ -399,32 +455,33 @@ class BaseAgent:
         return json.dumps(packet, ensure_ascii=False)
 
     def _needs_escalation(self, content: str) -> bool:
-        """检测 Agent 是否建议升级（简单关键词检测）。"""
-        keywords = ["转人工", "人工客服", "escalate", "specialist", "无法处理"]
-        return any(kw in content for kw in keywords)
+        """交接状态由真实工单工具决定，不能从回复措辞推断。"""
+        # 输出中出现“人工”不代表已交接；交接由明确请求和真实工单决定。
+        return False
+
 
 
 class GeneralAgent(BaseAgent):
     agent_type    = AgentType.GENERAL
     profile = AgentProfile(
-        role="通用客服分诊与首轮接待",
+        role="金融平台客服分诊与首轮接待",
         mission="快速回答基础问题，澄清不完整需求，并识别是否需要专业 Agent 或人工处理。",
         workflow=("复述诉求", "判断业务范围", "直接回答或补充必要信息", "给出下一步"),
-        input_contract=("对话历史", "用户画像", "意图与紧急度", "知识库上下文"),
+        input_contract=("对话历史", "语言及详略偏好", "意图与紧急度", "知识库上下文"),
         output_contract=("先回应核心问题", "信息不足时只询问必要字段", "明确下一步和边界"),
-        handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
+        handoff_conditions=("需修改权限、执行资金操作或处理投诉", "用户明确要求人工"),
         tool_scope=("search_knowledge_base", "inspect_request_context", "suggest_required_fields"),
         temperature=0.3,
         max_tokens=900,
     )
     system_prompt = (
-        "你是 FinClario 智能客服。友好、简洁地回答用户问题。"
+        "你是 FinClario 基金服务平台客服。友好、简洁地回答用户问题。"
         "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
     )
 
     def _build_role_packet(self, req: Request) -> str:
         packet = json.loads(super()._build_role_packet(req))
-        packet["triage_targets"] = ["technical", "billing", "escalation"]
+        packet["triage_targets"] = ["technical", "billing", "product", "escalation"]
         packet["response_mode"] = "answer_or_clarify"
         return json.dumps(packet, ensure_ascii=False)
 
@@ -468,43 +525,44 @@ class TechnicalAgent(BaseAgent):
 
 
 class BillingAgent(BaseAgent):
-    agent_type    = AgentType.BILLING
+    agent_type = AgentType.BILLING
     profile = AgentProfile(
-        role="账单核验与售后处理",
-        mission="区分扣款、退款、发票、订阅等资金场景，解释可判断事实，并明确核验和人工审核边界。",
-        workflow=("确认账单场景", "收集必要核验字段", "区分订单/实付/退款金额", "说明处理路径与时效", "判断是否升级"),
-        input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
-        output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效边界"),
-        handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
-        tool_scope=("search_knowledge_base", "check_billing_fields", "compare_amounts"),
-        temperature=0.0,
-        max_tokens=1100,
+        role="金融支付与费用争议服务",
+        mission="查询支付扣费记录，解释差额和争议核验路径，不执行退费。",
+        workflow=("确认支付编号", "查询所属记录", "区分扣款与份额确认", "说明争议核验路径"),
+        input_contract=("支付编号", "金额币种", "发生时间", "当前业务查询结果"),
+        output_contract=("记录及快照时间", "可确认与待核验内容", "后续指引"),
+        handoff_conditions=("用户投诉或请求人工核验",),
+        tool_scope=("search_knowledge_base", "check_billing_fields", "get_payment", "get_transaction", "compare_amounts"),
+        temperature=0.0, max_tokens=1100,
     )
-    system_prompt = (
-        "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
-        "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+    system_prompt = "你是基金服务平台的支付与费用客服。支付成功不等于申购确认；不得将基金赎回解释为商品退款。"
+
+    def _build_role_packet(self, req):
+        packet=json.loads(super()._build_role_packet(req))
+        packet['verification_fields']={k:req.entities.get(k,[]) for k in ('payment_id','transaction_id','amount','date')}
+        return json.dumps(packet,ensure_ascii=False)
+
+    def get_tools(self):
+        tools=super().get_tools()
+        extras=billing_tools()
+        # 已配置金融确定性金额工具时不允许旧定义覆盖。
+        return {**extras,**tools}
+
+
+class ProductConsultAgent(BaseAgent):
+    agent_type = AgentType.PRODUCT
+    profile = AgentProfile(
+        role="基金产品、风险与申赎规则咨询",
+        mission="基于产品资料解释类型、费用、风险、开放与申赎规则；调用确定性工具试算和查询进度。",
+        workflow=("明确产品", "查产品和知识来源", "需要时调用试算或进度工具", "说明依据及风险"),
+        input_contract=("产品编号", "金额币种及持有天数", "当前查询证据", "非权威的对话衔接"),
+        output_contract=("来源及适用时间", "计算公式", "风险及能力边界"),
+        handoff_conditions=("明确操作请求", "用户要求人工"),
+        tool_scope=("search_knowledge_base", "list_products", "get_product", "calculate_fee", "get_transaction", "get_account"),
+        temperature=0.1, max_tokens=1400,
     )
-
-    def _build_role_packet(self, req: Request) -> str:
-        packet = json.loads(super()._build_role_packet(req))
-        packet["verification_fields"] = {
-            "order_id": req.entities.get("order_id", []),
-            "amount": req.entities.get("amount", []),
-            "date": req.entities.get("date", []),
-            "missing_fields": [
-                field for field, values in (
-                    ("订单号或交易号", req.entities.get("order_id", [])),
-                    ("支付金额", req.entities.get("amount", [])),
-                ) if not values
-            ],
-            "risk_boundary": "不得承诺退款成功、立即到账或直接修改账单",
-        }
-        return json.dumps(packet, ensure_ascii=False)
-
-    def get_tools(self) -> Dict[str, AgentToolSpec]:
-        tools = super().get_tools()
-        tools.update(billing_tools())
-        return tools
+    system_prompt = "你负责基金产品资料解释。手续费怎么算是咨询。不得根据口头风险偏好推荐买卖，也不预测收益。"
 
 
 class EscalationAgent(BaseAgent):
@@ -522,7 +580,7 @@ class EscalationAgent(BaseAgent):
         input_contract=("用户消息", "意图", "紧急度", "结构化实体", "对话背景"),
         output_contract=("升级原因", "已知信息摘要", "还需补充的信息", "保守的后续说明"),
         handoff_conditions=("用户明确要求人工", "紧急或高风险场景"),
-        tool_scope=("search_knowledge_base", "create_handoff_summary"),
+        tool_scope=("search_knowledge_base", "create_service_ticket", "get_service_ticket", "update_service_ticket"),
         temperature=0.0,
         max_tokens=500,
     )
@@ -534,28 +592,17 @@ class EscalationAgent(BaseAgent):
         return tools
 
     async def handle(self, req: Request) -> AgentResponse:
+        # 人工节点必须调用真正的本地工单工具；不交由模型编造创建结果。
         t0 = time.monotonic()
         self.stats.total += 1
-        intent = req.intent.value if req.intent else "unknown"
-        urgency = req.urgency.name if req.urgency else "UNKNOWN"
-        entities = json.dumps(req.entities or {}, ensure_ascii=False)
-        content = (
-            "我已将这个问题标记为人工升级处理。\n\n"
-            f"升级原因：意图={intent}，紧急度={urgency}\n"
-            f"已记录信息：{entities}\n"
-            "请不要发送密码、短信验证码或完整支付凭证；人工客服会根据会话记录继续核验。"
-        )
-        ms = (time.monotonic() - t0) * 1000
-        self.stats.success += 1
+        result = await self._call_demo(req)
+        success = all(t.get('result_success',False) for t in result.tool_traces)
+        self.stats.success += int(success)
+        ms = (time.monotonic()-t0)*1000
         self.stats.total_ms += ms
-        return AgentResponse(
-            agent_type=self.agent_type,
-            content=content,
-            success=True,
-            latency_ms=ms,
-            escalate=True,
-            tools_used=[],
-        )
+        created = any(t['tool_name']=='create_service_ticket' and t.get('result_success') for t in result.tool_traces)
+        return AgentResponse(self.agent_type,result.content,success,latency_ms=ms,
+                             escalate=created,tools_used=result.tools_used,tool_traces=result.tool_traces)
 
 
 class ResponseComposer:
@@ -570,6 +617,8 @@ class ResponseComposer:
         successful = [response for response in responses if response.success and response.content.strip()]
         if not successful:
             return "抱歉，所有 Agent 均处理失败。"
+        if os.getenv("ECHOMIND_MODE", "demo") == "demo":
+            return "\n\n".join(r.content if i==0 else "补充说明：\n"+r.content for i,r in enumerate(successful))
         if len(successful) == 1:
             return successful[0].content
 
@@ -580,8 +629,8 @@ class ResponseComposer:
         prompt = (
             "你是客服 Response Composer，负责把多个专业 Agent 的结果合并成一条最终回复。\n"
             "要求：以主 Agent 的结论为主，按用户问题优先级组织内容；去掉重复和冲突表述；"
-            "不能补造订单、退款、后台查询结果；如果结论冲突，明确说明需要核验；"
-            "保留必要的排查步骤、核验字段和升级边界。只输出给用户看的中文回复，不要提及 Agent。\n\n"
+            "不能补造产品、申赎、支付、工单结果；如果结论冲突，明确说明需要核验；"
+            "保留来源、版本、模拟标识、风险提示、核验字段和升级边界。只输出给用户看的中文回复，不要提及 Agent。\n\n"
             f"主 Agent：{successful[0].agent_type.value}\n"
             f"用户问题：{req.message}\n"
             f"候选结果：\n{evidence}"
@@ -624,32 +673,39 @@ class AgentOrchestrator:
 
     # 意图 → Agent 类型的静态映射（路由表）
     _INTENT_ROUTING: Dict[IntentCategory, AgentType] = {
+        IntentCategory.PRODUCT: AgentType.PRODUCT,
+        IntentCategory.TRANSACTION_STATUS: AgentType.PRODUCT,
         IntentCategory.TECHNICAL:  AgentType.TECHNICAL,
         IntentCategory.TECHNICAL_LOGIN: AgentType.TECHNICAL,
         IntentCategory.TECHNICAL_CRASH: AgentType.TECHNICAL,
         IntentCategory.BILLING:    AgentType.BILLING,
-        IntentCategory.REFUND:     AgentType.BILLING,
-        IntentCategory.INVOICE:    AgentType.BILLING,
+        IntentCategory.REDEMPTION:     AgentType.PRODUCT,
+        IntentCategory.FEE_QUERY:    AgentType.PRODUCT,
         IntentCategory.PAYMENT_ISSUE: AgentType.BILLING,
-        IntentCategory.ACCOUNT:    AgentType.BILLING,
-        IntentCategory.ACCOUNT_SECURITY: AgentType.BILLING,
+        IntentCategory.ACCOUNT:    AgentType.GENERAL,
+        IntentCategory.ACCOUNT_SECURITY: AgentType.GENERAL,
         IntentCategory.ESCALATION: AgentType.ESCALATION,
         IntentCategory.HUMAN_HANDOFF: AgentType.ESCALATION,
         # 其余意图 → GENERAL（默认）
     }
 
+    # Monitor 的降权达到该值时，专业 Agent 暂停接收新请求并回退到 GeneralAgent。
+    # 使用环境变量可按线上数据调整，默认值与 Monitor 的严重成功率惩罚上限一致。
+    MONITOR_FALLBACK_PENALTY = 0.5
+
     def __init__(
         self,
         api_key:  str,
         base_url: Optional[str] = None,
-        model:    str = "claude-3-5-sonnet-20241022",
+        model:    str = "claude-sonnet-4-6",
         skill_manager: Optional[Any] = None,
         rag_tool_manager: Optional[Any] = None,
+        finance_store: Optional[Any] = None,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        client = AsyncAnthropic(**kwargs)
+        client = AsyncAnthropic(timeout=45.0, max_retries=1, **kwargs)
 
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
         self._skill_manager = skill_manager
@@ -662,8 +718,15 @@ class AgentOrchestrator:
             AgentType.GENERAL: [self._make_agent(GeneralAgent, client, model, skill_manager)],
             AgentType.TECHNICAL: [self._make_agent(TechnicalAgent, client, model, skill_manager)],
             AgentType.BILLING: [self._make_agent(BillingAgent, client, model, skill_manager)],
+            AgentType.PRODUCT: [self._make_agent(ProductConsultAgent, client, model, skill_manager)],
             AgentType.ESCALATION: [self._make_agent(EscalationAgent, client, model, skill_manager)],
         }
+        from finance.tools import build_finance_tools
+        for agents in self._pool.values():
+            for agent in agents:
+                agent._demo_mode = os.getenv('ECHOMIND_MODE','demo') == 'demo'
+                if finance_store is not None:
+                    agent._business_tools = build_finance_tools(finance_store,agent.agent_type.value)
         self.set_shared_tools(build_shared_rag_tools(rag_tool_manager))
 
     @staticmethod
@@ -707,8 +770,11 @@ class AgentOrchestrator:
         return await self._intent_recognizer.recognize(message, history=history)
 
     def _record_tool_trace(self, result: OrchestratorResult) -> None:
+        result.response, result.policy_warnings = finalize(result._message, result.response, result.tool_traces, getattr(result,'_history',None)) if hasattr(result,'_message') else (result.response,[])
         trace = {
             "request_id": result.request_id,
+            "user_id": getattr(result,'_user_id',''),
+            "policy_warnings":result.policy_warnings,
             "timestamp": datetime.now().isoformat(),
             "intent": result.intent.value if result.intent else None,
             "primary_agent": result.primary_agent.value if result.primary_agent else None,
@@ -720,9 +786,9 @@ class AgentOrchestrator:
         }
         self._recent_tool_traces.append(trace)
 
-    def get_tool_trace(self, request_id: str) -> Optional[Dict[str, Any]]:
+    def get_tool_trace(self, request_id: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         for trace in reversed(self._recent_tool_traces):
-            if trace.get("request_id") == request_id:
+            if trace.get("request_id") == request_id and (user_id is None or trace.get("user_id") == user_id):
                 return trace
         return None
 
@@ -749,10 +815,10 @@ class AgentOrchestrator:
             req.urgency = intent_result.urgency
             req.intent_confidence = intent_result.confidence
 
-        if self._needs_clarification(req):
+        if self._needs_clarification(req) and not operation_requested(req.message) and not wants_handoff(req.message):
             result = OrchestratorResult(
                 request_id=req.request_id,
-                response="我还不能确定您要处理的是哪类问题。请补充一下是订单物流、退款账单、账户资料，还是技术故障？",
+                response="我还不能确定您要处理的是哪类问题。请补充一下是产品与风险、申赎进度、支付扣费、账户资料，还是登录故障？",
                 agent_type=AgentType.GENERAL,
                 intent=req.intent,
                 escalated=False,
@@ -762,10 +828,13 @@ class AgentOrchestrator:
                 routing_reason="低置信度 OTHER 意图，先澄清用户需求",
                 routing_confidence=req.intent_confidence,
             )
+            result._message = req.message
+            result._user_id = req.user_id
+            result._history = req.history
             self._record_tool_trace(result)
             return result
 
-        # 复杂问题自动并行协作，例如同一句同时涉及登录故障和扣款/退款。
+        # 复杂问题自动并行协作，例如同一句同时涉及登录故障和支付扣费。
         decision = self._route_decision(req)
         if decision.multi_agent:
             return await self.run_parallel(req, decision)
@@ -775,13 +844,10 @@ class AgentOrchestrator:
 
         # 4. 升级检查
         escalated = False
-        if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent in (
-            IntentCategory.ESCALATION,
-            IntentCategory.HUMAN_HANDOFF,
-        ):
+        if response.escalate:
             escalated = True
             logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
-            # 生产环境：此处创建工单、通知人工客服
+            # 实际创建结果由 EscalationAgent 的工具轨迹确认。
 
         result = OrchestratorResult(
             request_id=req.request_id,
@@ -798,6 +864,9 @@ class AgentOrchestrator:
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
         )
+        result._message = req.message
+        result._user_id = req.user_id
+        result._history = req.history
         self._record_tool_trace(result)
         return result
 
@@ -842,6 +911,9 @@ class AgentOrchestrator:
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
         )
+        result._message = req.message
+        result._user_id = req.user_id
+        result._history = req.history
         self._record_tool_trace(result)
         return result
 
@@ -872,14 +944,14 @@ class AgentOrchestrator:
         先处理紧急/转人工，再用领域分数决定主 Agent 和辅助 Agent。
         这样可以表达“主处理 + 辅助诊断”，避免关键词命中后无主次地拼接。
         """
-        if req.urgency == UrgencyLevel.CRITICAL:
+        if operation_requested(req.message) or wants_handoff(req.message) or req.urgency == UrgencyLevel.CRITICAL:
             return RoutingDecision(
                 primary_agent=AgentType.ESCALATION,
                 reason="紧急度为 CRITICAL，触发升级路由",
                 confidence=1.0,
             )
 
-        if req.intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
+        if req.intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF) and re.search(r'SR[A-Z0-9]{6,}',req.message,re.I):
             return RoutingDecision(
                 primary_agent=AgentType.ESCALATION,
                 reason=f"意图为 {req.intent.value if req.intent else 'unknown'}，触发升级路由",
@@ -887,10 +959,16 @@ class AgentOrchestrator:
             )
 
         scores = self._domain_scores(req)
+        degraded_agents = {
+            agent_type
+            for agent_type in (AgentType.TECHNICAL, AgentType.BILLING, AgentType.PRODUCT)
+            if scores.get(agent_type, 0.0) > 0 and self._monitor_degraded(agent_type)
+        }
         available_scores = {
             agent_type: score
             for agent_type, score in scores.items()
-            if agent_type == AgentType.GENERAL or self._pool.get(agent_type)
+            if agent_type == AgentType.GENERAL
+            or (self._pool.get(agent_type) and agent_type not in degraded_agents)
         }
         if not available_scores:
             return RoutingDecision(
@@ -909,16 +987,10 @@ class AgentOrchestrator:
             if agent_type != primary_agent and agent_type in available_scores
         ]
 
-        if not supporting_agents:
-            supporting_agents = [
-                agent_type
-                for agent_type, score in ordered[1:]
-                if agent_type != AgentType.GENERAL
-                and score >= 0.45
-                and score >= primary_score * 0.55
-            ]
-
         reason = self._routing_reason(req, available_scores, primary_agent, supporting_agents)
+        if degraded_agents:
+            degraded_text = ", ".join(sorted(agent.value for agent in degraded_agents))
+            reason += f", monitor_fallback=[{degraded_text}]"
         return RoutingDecision(
             primary_agent=primary_agent,
             supporting_agents=supporting_agents,
@@ -927,64 +999,19 @@ class AgentOrchestrator:
         )
 
     def _domain_scores(self, req: Request) -> Dict[AgentType, float]:
-        """按意图、关键词和实体为各领域 Agent 打分。"""
-        msg = req.message.lower()
-        scores = {
-            AgentType.GENERAL: 0.1,
-            AgentType.TECHNICAL: 0.0,
-            AgentType.BILLING: 0.0,
-        }
-
-        if req.intent in (
-            IntentCategory.QUERY,
-            IntentCategory.ORDER_STATUS,
-            IntentCategory.LOGISTICS,
-            IntentCategory.REQUEST,
-            IntentCategory.COMPLAINT,
-            IntentCategory.GREETING,
-            IntentCategory.FEEDBACK,
-            IntentCategory.OTHER,
-        ):
-            scores[AgentType.GENERAL] += 0.55
-
-        if req.intent in (
-            IntentCategory.TECHNICAL,
-            IntentCategory.TECHNICAL_LOGIN,
-            IntentCategory.TECHNICAL_CRASH,
-        ):
-            scores[AgentType.TECHNICAL] += 0.75
-
-        if req.intent in (
-            IntentCategory.BILLING,
-            IntentCategory.ACCOUNT,
-            IntentCategory.ACCOUNT_SECURITY,
-            IntentCategory.REFUND,
-            IntentCategory.INVOICE,
-            IntentCategory.PAYMENT_ISSUE,
-        ):
-            scores[AgentType.BILLING] += 0.75
-
-        technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401", "验证码"]
-        billing_kws = ["退款", "退货", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice", "多扣"]
-        general_kws = ["订单", "物流", "快递", "配送", "会员", "积分", "咨询", "帮助"]
-
-        technical_hits = sum(1 for kw in technical_kws if kw in msg)
-        billing_hits = sum(1 for kw in billing_kws if kw in msg)
-        general_hits = sum(1 for kw in general_kws if kw in msg)
-
-        scores[AgentType.TECHNICAL] += min(0.45, technical_hits * 0.18)
-        scores[AgentType.BILLING] += min(0.45, billing_hits * 0.18)
-        scores[AgentType.GENERAL] += min(0.35, general_hits * 0.12)
-
-        entities = req.entities or {}
-        if entities.get("error_code"):
-            scores[AgentType.TECHNICAL] += 0.2
-        if entities.get("amount"):
-            scores[AgentType.BILLING] += 0.15
-        if entities.get("order_id"):
-            scores[AgentType.GENERAL] += 0.1
-
-        return {agent_type: round(score, 3) for agent_type, score in scores.items()}
+        scores = {AgentType.GENERAL:0.1,AgentType.TECHNICAL:0.0,AgentType.BILLING:0.0,AgentType.PRODUCT:0.0}
+        mapped = self._INTENT_ROUTING.get(req.intent,AgentType.GENERAL)
+        if mapped == AgentType.ESCALATION:
+            mapped = AgentType.GENERAL  # 工单操作资格由上游确定性规则决定，模型标签不能越过此边界。
+        scores[mapped] = scores.get(mapped,0)+0.75
+        text=req.message.lower()
+        keywords={AgentType.TECHNICAL:["登录","验证码","崩溃","报错","401","500"],
+                  AgentType.BILLING:["扣款","扣费","支付","账单","pay"],
+                  AgentType.PRODUCT:["基金","申购","赎回","收益","波动","流动性","手续费","em00","tx"]}
+        for role,words in keywords.items():
+            scores[role]+=min(0.4,sum(w in text for w in words)*0.16)
+        if req.entities.get('error_code'): scores[AgentType.TECHNICAL]+=0.2
+        return scores
 
     @staticmethod
     def _routing_reason(
@@ -1005,37 +1032,16 @@ class AgentOrchestrator:
         )
 
     def _collaboration_targets(self, req: Request) -> List[AgentType]:
-        """
-        判断是否需要多个 Agent 并行协作。
-
-        意图识别通常只返回一个主意图；这里用领域关键词补充检测复合问题，
-        例如"登录报错且被重复扣款"需要技术和账单 Agent 同时处理。
-        """
-        msg = req.message.lower()
-        targets: List[AgentType] = []
-
-        technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401"]
-        billing_kws = ["退款", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice"]
-
-        if req.intent in (
-            IntentCategory.TECHNICAL,
-            IntentCategory.TECHNICAL_LOGIN,
-            IntentCategory.TECHNICAL_CRASH,
-        ) or any(kw in msg for kw in technical_kws):
+        text=req.message.lower()
+        targets=[]
+        if any(w in text for w in ['登录','验证码','报错','崩溃','401','500']):
             targets.append(AgentType.TECHNICAL)
-        if req.intent in (
-            IntentCategory.BILLING,
-            IntentCategory.ACCOUNT,
-            IntentCategory.ACCOUNT_SECURITY,
-            IntentCategory.REFUND,
-            IntentCategory.INVOICE,
-            IntentCategory.PAYMENT_ISSUE,
-        ) or any(kw in msg for kw in billing_kws):
+        if any(w in text for w in ['扣款','扣费','支付争议','支付失败','pay']):
             targets.append(AgentType.BILLING)
-
-        # 保持顺序去重，并只返回当前有实例的 Agent 类型。
-        deduped = list(dict.fromkeys(targets))
-        return [agent_type for agent_type in deduped if self._pool.get(agent_type)]
+        # 仅同时明确涉及独立产品问题时才协作，普通费用咨询保持单 Agent。
+        if any(w in text for w in ['产品风险','申赎规则','手续费','赎回进度']):
+            targets.append(AgentType.PRODUCT)
+        return [role for role in targets if self._pool.get(role)] if len(targets)>1 else []
 
     @staticmethod
     def _needs_clarification(req: Request) -> bool:
@@ -1057,6 +1063,24 @@ class AgentOrchestrator:
             return None
         return max(agents, key=lambda a: a.stats.routing_score())
 
+    def _monitor_degraded(self, agent_type: AgentType) -> bool:
+        """专业 Agent 降权过高时由路由层回退，确保单实例部署也能生效。"""
+        if agent_type in (AgentType.GENERAL, AgentType.ESCALATION):
+            return False
+        agents = self._pool.get(agent_type, [])
+        if not agents:
+            return False
+        threshold = _env_float(
+            "ECHOMIND_MONITOR_FALLBACK_PENALTY",
+            self.MONITOR_FALLBACK_PENALTY,
+        )
+        penalties = [
+            float(getattr(getattr(agent, "stats", None), "monitor_penalty", 0.0) or 0.0)
+            for agent in agents
+        ]
+        # 只要还有一个健康实例就继续使用该专业类型；全部高降权时才回退。
+        return min(penalties) >= min(max(threshold, 0.0), 0.9)
+
     async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
         """执行 Agent，失败时降级到 GeneralAgent。"""
         agent = self._best_agent(agent_type)
@@ -1072,11 +1096,14 @@ class AgentOrchestrator:
         response = await agent.handle(req)
 
         # 专属 Agent 失败时降级到 GeneralAgent
-        if not response.success and agent_type not in (AgentType.GENERAL, AgentType.ESCALATION):
+        if not response.success and not response.content.startswith("模型服务认证失败") and agent_type not in (AgentType.GENERAL, AgentType.ESCALATION):
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
+                original = response
                 response = await fallback.handle(req)
+                response.tools_used = list(dict.fromkeys(original.tools_used+response.tools_used))
+                response.tool_traces = original.tool_traces+response.tool_traces
 
         return response
 
@@ -1090,6 +1117,10 @@ class AgentOrchestrator:
                 result[key] = {
                     "total":        agent.stats.total,
                     "success_rate": round(agent.stats.success_rate, 3),
+                    "invocation_completion_rate": round(agent.stats.success_rate, 3),
+                    "success_rate_scope": "调用完成率，不代表业务任务成功率",
+                    "tool_calls": agent.stats.tool_calls,
+                    "tool_result_success_rate": round(agent.stats.tool_results_success/agent.stats.tool_calls,3) if agent.stats.tool_calls else None,
                     "avg_ms":       round(agent.stats.avg_ms, 1),
                     "monitor_penalty": round(agent.stats.monitor_penalty, 3),
                     "routing_score": round(agent.stats.routing_score(), 3),

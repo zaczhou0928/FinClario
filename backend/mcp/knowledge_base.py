@@ -14,9 +14,12 @@ ChromaDB 在这里的角色：
 import asyncio
 import hashlib
 import logging
+import json
+import re
+from datetime import date
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import chromadb
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +33,7 @@ class KnowledgeBase:
     不需要额外调用 Anthropic Embeddings API。
     """
 
-    COLLECTION_NAME = "knowledge_base"
+    COLLECTION_NAME = "finance_knowledge_v1"
 
     def __init__(
         self,
@@ -38,7 +41,8 @@ class KnowledgeBase:
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
     ):
-        # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
+        import chromadb
+        # 优先连接独立 ChromaDB 服务（Chroma 默认 embedding 通常在客户端执行，需要可用模型缓存）
         self._use_server = False
         try:
             # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
@@ -57,8 +61,7 @@ class KnowledgeBase:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 使用服务端时不传 embedding_function，让服务端处理
-        # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
+        # 使用默认 embedding function，首次运行可能需要下载模型；演示走本地词法适配器。
         self._collection = self._client.get_or_create_collection(
             name=self.COLLECTION_NAME,
             metadata={"description": "FinClario RAG 知识库"},
@@ -79,21 +82,23 @@ class KnowledgeBase:
         """
         ids, docs, metas = [], [], []
 
-        for doc in documents:
+        for raw in documents:
+            doc = validate_document(raw)
             title   = doc.get("title", "")
             content = doc.get("content", "")
             chunks  = self._chunk_text(content, chunk_size=500)
 
             for i, chunk in enumerate(chunks):
-                doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
+                doc_id = hashlib.sha256(f"{doc['doc_id']}_{doc['version']}_{i}".encode()).hexdigest()
                 ids.append(doc_id)
                 docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
+                metas.append({**{k:v for k,v in doc.items() if k != "content"}, "chunk_index": i, "total_chunks": len(chunks)})
 
         if ids:
-            # ChromaDB 会自动生成 Embedding
-            self._collection.add(ids=ids, documents=docs, metadatas=metas)
-            logger.info(f"知识库导入 {len(ids)} 个文档片段")
+            # ID 由文档内容稳定生成；upsert 使重复导入幂等，同时允许同 ID 内容更新。
+            # ChromaDB 会自动生成或更新 Embedding。
+            self._collection.upsert(ids=ids, documents=docs, metadatas=metas)
+            logger.info(f"知识库写入 {len(ids)} 个文档片段")
 
         return len(ids)
 
@@ -107,9 +112,12 @@ class KnowledgeBase:
 
         ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
         """
+        count = self._collection.count()
+        if count == 0:
+            return []
         results = self._collection.query(
             query_texts=[query],
-            n_results=top_k,
+            n_results=min(max(top_k*3,10),count),
         )
 
         items = []
@@ -119,14 +127,21 @@ class KnowledgeBase:
                 results["metadatas"][0],
                 results["distances"][0],
             ):
+                today = date.today().isoformat()
+                if meta.get("source_type") == "unverified" or not meta.get("effective_from", "9999") <= today <= meta.get("effective_to", "0000"):
+                    continue
+                product_ids = set(re.findall(r"EM\d{3}",query.upper()))
+                if product_ids and meta.get("product_id") not in product_ids | {"ALL"}:
+                    continue
                 items.append({
+                    **meta,
                     "title":    meta.get("title", ""),
                     "content":  doc,
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
                     "chunk":    meta.get("chunk_index", 0),
                 })
 
-        return items
+        return items[:max(1,min(top_k,10))]
 
     async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """异步检索；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
@@ -184,77 +199,22 @@ class KnowledgeBase:
         return chunks
 
     def _load_default_docs(self) -> None:
-        """导入默认知识库文档（客服场景常见问题）。"""
-        default_docs = [
-            {
-                "title": "退款政策",
-                "content": (
-                    "退款政策说明。"
-                    "用户在购买后 7 天内可以申请无理由退款。"
-                    "退款申请提交后，系统会在 1-3 个工作日内审核。"
-                    "审核通过后，款项将在 5-7 个工作日内退回原支付账户。"
-                    "如果商品已发货，需要先完成退货流程才能退款。"
-                    "退货运费由用户承担，除非是商品质量问题。"
-                    "超过 7 天但未超过 30 天的订单，需要提供商品质量问题的证据才能退款。"
-                ),
-            },
-            {
-                "title": "订单查询",
-                "content": (
-                    "订单查询指南。"
-                    "用户可以通过订单号查询订单状态。"
-                    "订单状态包括：待支付、已支付、已发货、运输中、已签收、已完成。"
-                    "如果订单显示已发货但超过 7 天未收到，可以联系客服申请查件。"
-                    "物流信息通常在发货后 24 小时内更新。"
-                    "如果订单显示异常，请提供订单号联系客服处理。"
-                ),
-            },
-            {
-                "title": "账户安全",
-                "content": (
-                    "账户安全说明。"
-                    "建议用户定期修改密码，密码长度至少 8 位，包含字母和数字。"
-                    "如果忘记密码，可以通过绑定的手机号或邮箱重置。"
-                    "发现账户异常登录时，系统会自动锁定账户并发送通知。"
-                    "用户可以在安全设置中开启两步验证，提高账户安全性。"
-                    "不要将密码分享给他人，客服人员不会索要用户密码。"
-                ),
-            },
-            {
-                "title": "技术故障排查",
-                "content": (
-                    "常见技术问题排查。"
-                    "应用崩溃：请尝试清除缓存后重启应用，如果问题持续请更新到最新版本。"
-                    "登录失败 401 错误：表示认证失败，请检查用户名密码是否正确，或尝试重置密码。"
-                    "页面加载慢：检查网络连接，尝试切换 WiFi 或移动数据。"
-                    "支付失败：确认银行卡余额充足，检查是否开启了网上支付功能。"
-                    "500 服务器错误：这是服务端问题，请稍后重试，如果持续出现请联系技术支持。"
-                ),
-            },
-            {
-                "title": "会员与积分",
-                "content": (
-                    "会员积分规则。"
-                    "每消费 1 元累积 1 积分。"
-                    "积分可以在下次购物时抵扣，100 积分 = 1 元。"
-                    "会员等级分为：普通会员、银卡会员（累计消费 1000 元）、金卡会员（累计消费 5000 元）。"
-                    "银卡会员享受 95 折优惠，金卡会员享受 9 折优惠。"
-                    "积分有效期为 1 年，过期自动清零。"
-                    "生日当月消费可获得双倍积分。"
-                ),
-            },
-            {
-                "title": "配送说明",
-                "content": (
-                    "配送服务说明。"
-                    "标准配送：3-5 个工作日送达，免运费（订单满 99 元）。"
-                    "加急配送：1-2 个工作日送达，运费 15 元。"
-                    "同城配送：当日达或次日达，运费 10 元。"
-                    "偏远地区可能需要额外 2-3 天。"
-                    "配送时间为每天 9:00-18:00，节假日可能延迟。"
-                    "如果需要修改收货地址，请在发货前联系客服。"
-                ),
-            },
-        ]
-        self.add_documents(default_docs)
-        logger.info(f"已导入默认知识库: {len(default_docs)} 篇文档")
+        from finance.store import DATA_DIR
+        self.add_documents(json.loads((DATA_DIR / 'knowledge.json').read_text()))
+
+
+def validate_document(raw):
+    if not isinstance(raw,dict) or not raw.get('title') or not raw.get('content'):
+        raise ValueError('文档必须包含非空 title 和 content')
+    d={k:str(raw.get(k,'')) for k in ('title','content','source','source_url','version','effective_from','effective_to','product_id','source_type','doc_id')}
+    d['doc_id']=d['doc_id'] or hashlib.sha256((d['title']+d['content']).encode()).hexdigest()
+    d['source_type']=d['source_type'] or 'unverified'
+    if d['source_type'] not in ('simulation','public_education','unverified'):
+        raise ValueError('source_type 必须为 simulation/public_education/unverified')
+    d['product_id']=d['product_id'] or 'ALL'
+    if d['source_type'] != 'unverified':
+        for k in ('source','version','effective_from','effective_to'):
+            if not d[k]: raise ValueError('已核验资料必须包含 '+k)
+        date.fromisoformat(d['effective_from']); date.fromisoformat(d['effective_to'])
+        if d['effective_from'] > d['effective_to']: raise ValueError('适用时间范围无效')
+    return d

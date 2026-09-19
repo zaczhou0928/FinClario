@@ -12,7 +12,7 @@
   - 人工升级摘要
   - 共享知识库 RAG
 
-订单查询、退款执行、账单修改等需要真实业务系统授权的动作不在这里伪造。
+申赎查询、资金执行、账单修改等需要真实业务系统授权的动作不在这里伪造。
 """
 
 from __future__ import annotations
@@ -76,8 +76,8 @@ def suggest_required_fields(req: Request, args: Dict[str, Any]) -> Dict[str, Any
     """通用客服工具：按业务类型计算下一轮只需询问的字段。"""
     intent = req.intent.value if req.intent else "other"
     fields: List[str] = []
-    if intent in {"order_status", "logistics"}:
-        fields = ["订单号或下单时间"]
+    if intent in {"transaction_status", "redemption"}:
+        fields = ["业务编号或申请时间"]
     elif intent in {"account", "account_security"}:
         fields = ["登录方式或账号标识", "问题发生时间"]
     elif intent in {"complaint", "request"}:
@@ -95,8 +95,8 @@ def lookup_error_code(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
     """技术工具：解释常见错误码的排查方向，不声称读取了服务端日志。"""
     code = str(args.get("error_code", "")).upper().strip()
     mapping = {
-        "401": ("认证失败", ["确认 Token/API Key 是否过期", "确认请求时间戳和签名", "确认账号登录状态"]),
-        "403": ("权限不足", ["确认账号或套餐权限", "确认资源权限和 IP 白名单"]),
+        "401": ("认证失败", ["退出后重新登录，不要分享密码或验证码", "确认设备时间与客户端版本", "确认账号登录状态"]),
+        "403": ("权限不足", ["通过正式服务入口核验账号状态", "记录发生页面与时间，勿分享个人凭证"]),
         "404": ("资源或路径不存在", ["确认接口路径和环境", "确认资源标识是否正确"]),
         "500": ("服务端处理异常", ["记录 request_id 和发生时间", "检查依赖服务、参数格式和服务端日志"]),
     }
@@ -133,7 +133,7 @@ def build_diagnostic_plan(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
 def check_billing_fields(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
     """账单工具：检查必要核验字段是否齐全。"""
     fields = {
-        "order_id": bool(req.entities.get("order_id")),
+        "transaction_id": bool(req.entities.get("transaction_id")),
         "amount": bool(req.entities.get("amount")),
         "date": bool(req.entities.get("date")),
         "payment_channel": bool(args.get("payment_channel")),
@@ -141,25 +141,20 @@ def check_billing_fields(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "fields": fields,
         "missing_fields": [name for name, present in fields.items() if not present],
-        "can_confirm_refund": False,
-        "reason": "当前工具只做字段检查，不连接订单或支付系统",
+        "can_execute_funds": False,
+        "reason": "当前工具只做字段检查，业务事实需要 get_payment/get_transaction 工具核验",
     }
 
 
 def compare_amounts(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
     """账单工具：只做用户明确提供金额之间的算术。"""
-    try:
-        first = float(args["amount_a"])
-        second = float(args["amount_b"])
-    except (KeyError, TypeError, ValueError):
-        return {"success": False, "error": "amount_a 和 amount_b 必须是数字"}
-    return {
-        "success": True,
-        "amount_a": first,
-        "amount_b": second,
-        "difference": round(first - second, 2),
-        "interpretation": "仅表示金额差值，不代表重复扣款或退款结论",
-    }
+    from finance.store import money
+    if args.get('currency') != 'CNY':
+        return {'success':False,'error':'只支持同币种 CNY，不换汇'}
+    first,second=money(args['amount_a']),money(args['amount_b'])
+    return {'success':True,'amount_a':str(first),'amount_b':str(second),
+            'difference':str(first-second),'currency':'CNY',
+            'notice':'仅是金额差值，不代表重复扣款或已批准退费'}
 
 
 def create_handoff_summary(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -205,6 +200,7 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
             "top_k": top_k,
             "results": result.data,
             "reranked": bool(getattr(result, "reranked", False)),
+            "cached": bool(getattr(result, "cached", False)),
         }
 
     return {
@@ -264,19 +260,20 @@ def billing_tools() -> Dict[str, AgentToolSpec]:
     return {
         "check_billing_fields": make_tool(
             "check_billing_fields",
-            "检查账单核验字段是否齐全；不连接订单、支付或退款系统。",
+            "检查账单核验字段是否齐全；需另查业务记录。",
             {"payment_channel": {"type": "string", "description": "支付渠道，例如微信、支付宝、银行卡"}},
             check_billing_fields,
         ),
         "compare_amounts": make_tool(
             "compare_amounts",
-            "计算用户明确提供的两笔金额差值；不判断是否重复扣款，也不执行退款。",
+            "计算用户明确提供的两笔金额差值；不判断是否重复扣款，也不执行退费。",
             {
-                "amount_a": {"type": "number", "description": "第一笔金额"},
-                "amount_b": {"type": "number", "description": "第二笔金额"},
+                "amount_a": {"type": "string", "description": "第一笔金额"},
+                "amount_b": {"type": "string", "description": "第二笔金额"},
+                "currency": {"type":"string", "enum":["CNY"]},
             },
             compare_amounts,
-            required=["amount_a", "amount_b"],
+            required=["amount_a", "amount_b", "currency"],
         ),
     }
 

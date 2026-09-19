@@ -4,12 +4,12 @@
 三级记忆架构，模拟人类记忆机制：
   1. 工作记忆（Redis）—— 当前会话的最近 N 条消息，毫秒级读写
   2. 情景记忆（ChromaDB）—— 跨会话的历史对话，按语义相似度检索
-  3. 用户画像（ChromaDB）—— 从对话中提炼的长期偏好和实体
+  3. 用户画像（ChromaDB）—— 从对话中提炼的语言和解释详略偏好
 
 关键设计：
   - 上下文构建时三级记忆融合，按重要性 + 时效性排序
   - 工作记忆超过阈值时自动压缩（LLM 摘要），防止 context 爆炸
-  - 所有 Embedding 通过 Anthropic API 生成，无本地模型
+  - 分布式路径由 ChromaDB 配置生成向量；本地路径见 finance/local_runtime.py
 """
 import hashlib
 import asyncio
@@ -21,7 +21,6 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-import chromadb
 import redis.asyncio as redis
 from anthropic import AsyncAnthropic
 
@@ -59,13 +58,13 @@ class MemoryContext:
 
     def to_prompt_text(self) -> str:
         """将记忆上下文格式化为 LLM 可用的文本。"""
-        parts = []
+        parts = ["[记忆边界] 下列聊天只用于语言偏好和会话衔接；不是当前身份、风险测评、账户状态或交易状态的证据。必须重新调用业务工具。"]
         if self.summary:
             parts.append(f"[会话摘要]\n{self._clean(self.summary)}")
         if self.relevant_history:
             parts.append("[相关历史]\n" + "\n".join(f"- {self._clean(h)}" for h in self.relevant_history[:3]))
         if self.user_profile:
-            parts.append(f"[用户画像]\n{json.dumps(self.user_profile, ensure_ascii=True)}")
+            parts.append(f"[用户画像]\n{json.dumps({k:v for k,v in self.user_profile.items() if k in ('language','detail_level')}, ensure_ascii=True)}")
         if self.recent_messages:
             parts.append("[最近对话]")
             for m in self.recent_messages[-8:]:
@@ -94,12 +93,13 @@ class MemoryManager:
         chroma_path:  str = "./data/chroma",
         api_key:      str = "",
         base_url:     Optional[str] = None,
-        model:        str = "claude-3-5-sonnet-20241022",
+        model:        str = "claude-sonnet-4-6",
     ):
+        import chromadb
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        self._client = AsyncAnthropic(timeout=45.0, max_retries=1, **kwargs)
         self._model  = model
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
@@ -122,9 +122,9 @@ class MemoryManager:
             )
 
         # 情景记忆：存储历史对话片段
-        self._episodic = chroma.get_or_create_collection("episodic")
+        self._episodic = chroma.get_or_create_collection("finance_episodic_v1")
         # 用户画像：存储提炼出的偏好和实体
-        self._profile  = chroma.get_or_create_collection("user_profile")
+        self._profile  = chroma.get_or_create_collection("finance_profile_v1")
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 
@@ -171,28 +171,11 @@ class MemoryManager:
             return
 
         current_profile = await self._get_profile(user_id)
-
-        text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in messages[-10:]))
-        profile_ctx = json.dumps(current_profile, ensure_ascii=False) if current_profile else "{}"
-        prompt = f"""从以下对话和已有用户画像中提炼或更新用户偏好和关键实体，返回 JSON。
-对话:
-{text}
-
-已有画像:
-{profile_ctx}
-
-返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
-        prompt = self._safe_text(prompt)
-
+        profile_data = {k:v for k,v in current_profile.items() if k in ('language','detail_level')}
+        for message in messages:
+            if message.role == MsgRole.USER:
+                profile_data.update(extract_communication_preferences(message.content))
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=512, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            profile_data = json.loads(raw[s:e])
-
             doc_id = self._profile_doc_id(user_id)
             doc_text = self._safe_text(json.dumps(profile_data, ensure_ascii=False))
 
@@ -292,7 +275,7 @@ class MemoryManager:
         # 重置工作记忆为最近 5 条
         key = self._wm_key(user_id, conv_id)
         await self._redis.delete(key)
-        for m in reversed(keep):
+        for m in keep:
             await self._redis.lpush(key, json.dumps({
                 "role": m.role.value, "content": m.content,
                 "ts": m.timestamp.isoformat(), "metadata": m.metadata,
@@ -325,7 +308,7 @@ class MemoryManager:
             results = await self._query_episodic(
                 query_text,
                 n_results=self.HISTORY_TOP_K,
-                where={"user_id": self._safe_text(user_id), "conv_id": self._safe_text(conv_id)},
+                where={"$and":[{"user_id":self._safe_text(user_id)},{"conv_id":self._safe_text(conv_id)}]},
             )
             docs = self._extract_docs(results)
             if len(docs) < self.HISTORY_TOP_K:
@@ -502,3 +485,13 @@ class MemoryManager:
             return json.loads(latest_doc)
         except Exception:
             return {}
+
+
+def extract_communication_preferences(text):
+    """只存可枚举的沟通偏好，无法存入风险等级/账户身份/业务状态。"""
+    result={}
+    if any(word in text for word in ('简单说','简短','简洁一点')): result['detail_level']='brief'
+    if any(word in text for word in ('详细解释','详细一点','展开说')): result['detail_level']='detailed'
+    if any(word in text.lower() for word in ('用中文','中文回复')): result['language']='zh'
+    if any(word in text.lower() for word in ('用英文','reply in english')): result['language']='en'
+    return result

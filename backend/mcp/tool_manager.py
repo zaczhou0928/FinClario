@@ -17,6 +17,8 @@ import hashlib
 import inspect
 import json
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -134,11 +136,11 @@ class MCPToolManager:
       用户查询 → 查询改写（多角度子查询）→ 并行召回 → 结果重排 → 返回 Top-K
     """
 
-    def __init__(self, api_key: str, base_url: Optional[str] = None, model: str = "claude-3-5-sonnet-20241022"):
+    def __init__(self, api_key: str, base_url: Optional[str] = None, model: str = "claude-sonnet-4-6"):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        self._client = AsyncAnthropic(timeout=45.0, max_retries=1, **kwargs)
         self._model  = model
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
@@ -211,7 +213,7 @@ class MCPToolManager:
             reranked = False
             if rerank_top_k > 0 and tool.supports_rerank and isinstance(data, list):
                 query = params.get("query", "")
-                data, reranked = await self._rerank(query, data, rerank_top_k), True
+                data, reranked = await self._rerank_with_status(query, data, rerank_top_k)
 
             # 写缓存：缓存最终返回结果，避免下次命中未重排的原始结果。
             if tool.cache_ttl > 0:
@@ -284,11 +286,11 @@ class MCPToolManager:
         用 LLM 将原始查询改写为 n 个不同角度的子查询。
 
         目的：单一查询往往只能召回某一角度的文档，
-        多角度子查询并行检索后合并，显著提升召回率。
+        多角度子查询并行检索后合并，旨在扩大召回覆盖，效果需测量。
 
         示例：
-          原始: "退款流程"
-          改写: ["如何申请退款", "退款需要多少天", "退款政策是什么"]
+          原始: "赎回规则"
+          改写: ["赎回如何确认", "赎回预计到账", "赎回费用计算"]
         """
         prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
 要求：每个子查询角度不同，覆盖原始问题的不同方面。
@@ -321,6 +323,9 @@ class MCPToolManager:
 
         这是解决"检索不全、召回不好"的完整方案。
         """
+        top_k = max(1,min(int(top_k),10))
+        if os.getenv('ECHOMIND_MODE','demo') == 'demo':
+            return await self.call(tool_name,{'query':query,'top_k':top_k},context)
         # 1. 查询改写：生成多角度子查询
         sub_queries = await self.rewrite_query(query, n=3)
         logger.info(f"查询改写: {query!r} → {sub_queries}")
@@ -338,29 +343,36 @@ class MCPToolManager:
         for r in results:
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
                 for item in r.data:
-                    key = hashlib.md5(str(item).encode()).hexdigest()
+                    key = str(item.get("doc_id", ""))+str(item.get("chunk", "")) if isinstance(item,dict) and item.get("doc_id") else hashlib.md5(str(item).encode()).hexdigest()
                     if key not in seen:
                         seen.add(key)
                         merged.append(item)
 
+        product_ids=set(re.findall(r'EM\d{3}',query.upper()))
+        if product_ids:
+            merged=[d for d in merged if isinstance(d,dict) and d.get('product_id') in product_ids|{'ALL'}]
         if not merged:
             return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
 
         # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
-        reranked = await self._rerank(query, merged, top_k)
-        return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
+        reranked, did_rerank = await self._rerank_with_status(query, merged, top_k)
+        return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=did_rerank)
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
     async def _rerank(self, query: str, items: List[Any], top_k: int) -> List[Any]:
+        items, _ = await self._rerank_with_status(query,items,top_k)
+        return items
+
+    async def _rerank_with_status(self, query, items, top_k):
         """
         用 LLM 对召回结果重新打分排序。
 
         解决问题：向量检索的相似度分数不等于"对用户有用"，
-        LLM 能理解语义相关性，重排后 Top-K 质量显著提升。
+        LLM 能理解语义相关性，重排后 用于调整 Top-K 排序，效果需测量。
         """
         if len(items) <= top_k:
-            return items
+            return items, False
 
         # 将结果序列化为文本供 LLM 评分
         items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
@@ -382,11 +394,12 @@ class MCPToolManager:
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
             order: List[int] = json.loads(raw[s:e])
-            reranked = [items[i] for i in order if 0 <= i < len(items)]
-            return reranked[:top_k]
+            order = list(dict.fromkeys(i for i in order if type(i) is int and 0 <= i < len(items)))
+            order += [i for i in range(len(items)) if i not in order]
+            return [items[i] for i in order[:top_k]], True
         except Exception as ex:
             logger.warning(f"重排失败，返回原始顺序: {ex}")
-            return items[:top_k]
+            return items[:top_k], False
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 

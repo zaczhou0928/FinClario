@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -33,13 +34,13 @@ class IntentCategory(Enum):
     GREETING   = "greeting"    # 问候
     ESCALATION = "escalation"  # 要求升级/转人工
     TECHNICAL  = "technical"   # 技术问题
-    BILLING    = "billing"     # 账单/退款
+    BILLING    = "billing"     # 支付/扣费
     ACCOUNT    = "account"     # 账户管理
     FEEDBACK   = "feedback"    # 正面反馈
-    ORDER_STATUS = "order_status"        # 订单状态
-    LOGISTICS = "logistics"              # 物流配送
-    REFUND = "refund"                    # 退款/退货
-    INVOICE = "invoice"                  # 发票
+    TRANSACTION_STATUS = "transaction_status"  # 申赎进度
+    PRODUCT = "product"             # 产品资料
+    REDEMPTION = "redemption"          # 申赎规则
+    FEE_QUERY = "fee_query"           # 产品费用
     PAYMENT_ISSUE = "payment_issue"      # 支付/扣款异常
     ACCOUNT_SECURITY = "account_security" # 账户安全
     TECHNICAL_LOGIN = "technical_login"  # 登录认证故障
@@ -69,31 +70,31 @@ class IntentResult:
 
 # ── Few-shot 模板（同时用于 LLM 示例和 Embedding 匹配）────────────────────────
 _TEMPLATES: Dict[IntentCategory, List[str]] = {
-    IntentCategory.QUERY:      ["我的订单状态是什么？", "如何重置密码？", "快递什么时候到？"],
-    IntentCategory.COMPLAINT:  ["等了好几个小时！", "服务太差了！", "一直没人处理！"],
-    IntentCategory.REQUEST:    ["帮我取消订单", "我需要修改地址", "请协助退款"],
-    IntentCategory.GREETING:   ["你好", "嗨，有人吗", "早上好"],
-    IntentCategory.ESCALATION: ["我要投诉！", "转人工客服", "找你们经理"],
-    IntentCategory.TECHNICAL:  ["应用一直崩溃", "无法登录", "出现500错误"],
-    IntentCategory.BILLING:    ["为什么扣了两次款？", "申请退款", "发票问题"],
-    IntentCategory.ACCOUNT:    ["修改邮箱", "注销账户", "更新个人信息"],
-    IntentCategory.FEEDBACK:   ["服务很棒！", "非常满意", "给个好评"],
-    IntentCategory.ORDER_STATUS: ["我的订单现在是什么状态？", "订单有没有发货？", "订单处理到哪一步了？"],
-    IntentCategory.LOGISTICS: ["快递什么时候到？", "物流一直不更新", "配送要多久？"],
-    IntentCategory.REFUND: ["我要申请退款", "退货退款怎么处理？", "退款多久到账？"],
-    IntentCategory.INVOICE: ["帮我开发票", "发票抬头怎么改？", "电子发票在哪里？"],
-    IntentCategory.PAYMENT_ISSUE: ["为什么重复扣款？", "支付失败怎么办？", "这个月多扣了钱"],
-    IntentCategory.ACCOUNT_SECURITY: ["账户被盗了", "发现异常登录", "我要重置密码"],
-    IntentCategory.TECHNICAL_LOGIN: ["登录一直报401", "验证码收不到", "无法登录账号"],
-    IntentCategory.TECHNICAL_CRASH: ["应用一直崩溃", "页面报500错误", "系统闪退"],
-    IntentCategory.HUMAN_HANDOFF: ["转人工客服", "我要找人工", "请升级处理"],
+    IntentCategory.QUERY: ["怎么联系平台客服？", "有哪些服务？"],
+    IntentCategory.COMPLAINT: ["我要投诉扣款争议一直没有解决"],
+    IntentCategory.REQUEST: ["帮我全部赎回", "请解冻账户"],
+    IntentCategory.GREETING: ["你好", "早上好"],
+    IntentCategory.ESCALATION: ["请创建服务工单"],
+    IntentCategory.TECHNICAL: ["页面加载很慢"],
+    IntentCategory.BILLING: ["我的支付记录是什么？"],
+    IntentCategory.ACCOUNT: ["查询我的正式风险测评", "账户服务怎么办理"],
+    IntentCategory.FEEDBACK: ["谢谢，解释很清楚"],
+    IntentCategory.TRANSACTION_STATUS: ["查询 TX1001 赎回进度", "申购确认了吗"],
+    IntentCategory.PRODUCT: ["EM002 是什么类型，风险多高？", "历史收益能保证未来收益吗？", "基金波动与流动性是什么意思"],
+    IntentCategory.REDEMPTION: ["EM002 赎回多久到账？", "申购确认规则是什么？"],
+    IntentCategory.FEE_QUERY: ["全部赎回手续费怎么算", "EM002 持有10天，赎回10000元手续费多少？"],
+    IntentCategory.PAYMENT_ISSUE: ["PAY1001 为什么重复扣款？", "支付失败怎么办？"],
+    IntentCategory.ACCOUNT_SECURITY: ["账户被盗了", "发现异常登录"],
+    IntentCategory.TECHNICAL_LOGIN: ["登录一直报401", "验证码收不到"],
+    IntentCategory.TECHNICAL_CRASH: ["应用一直崩溃", "页面报500"],
+    IntentCategory.HUMAN_HANDOFF: ["转人工客服", "查询服务工单 SR123456ABCDEF"],
 }
 
 _SPECIFIC_INTENTS = {
-    IntentCategory.ORDER_STATUS,
-    IntentCategory.LOGISTICS,
-    IntentCategory.REFUND,
-    IntentCategory.INVOICE,
+    IntentCategory.TRANSACTION_STATUS,
+    IntentCategory.PRODUCT,
+    IntentCategory.REDEMPTION,
+    IntentCategory.FEE_QUERY,
     IntentCategory.PAYMENT_ISSUE,
     IntentCategory.ACCOUNT_SECURITY,
     IntentCategory.TECHNICAL_LOGIN,
@@ -110,10 +111,10 @@ _GENERIC_INTENTS = {
 }
 
 _INTENT_GROUPS: Dict[IntentCategory, IntentCategory] = {
-    IntentCategory.ORDER_STATUS: IntentCategory.QUERY,
-    IntentCategory.LOGISTICS: IntentCategory.QUERY,
-    IntentCategory.REFUND: IntentCategory.BILLING,
-    IntentCategory.INVOICE: IntentCategory.BILLING,
+    IntentCategory.TRANSACTION_STATUS: IntentCategory.PRODUCT,
+    IntentCategory.PRODUCT: IntentCategory.PRODUCT,
+    IntentCategory.REDEMPTION: IntentCategory.PRODUCT,
+    IntentCategory.FEE_QUERY: IntentCategory.PRODUCT,
     IntentCategory.PAYMENT_ISSUE: IntentCategory.BILLING,
     IntentCategory.ACCOUNT_SECURITY: IntentCategory.ACCOUNT,
     IntentCategory.TECHNICAL_LOGIN: IntentCategory.TECHNICAL,
@@ -123,7 +124,7 @@ _INTENT_GROUPS: Dict[IntentCategory, IntentCategory] = {
 
 # 紧急关键词
 _URGENCY_KEYWORDS = {
-    UrgencyLevel.CRITICAL: ["紧急", "emergency", "urgent", "asap", "立刻"],
+    UrgencyLevel.CRITICAL: ["账户被盗", "未经授权的交易", "资金被盗"],
     UrgencyLevel.HIGH:     ["今天", "马上", "尽快", "hurry", "now"],
     UrgencyLevel.MEDIUM:   ["这周", "soon", "快点"],
 }
@@ -149,13 +150,13 @@ class IntentRecognizer:
         self,
         api_key: str,
         base_url: Optional[str] = None,
-        model: str = "claude-3-5-sonnet-20241022",
+        model: str = "claude-sonnet-4-6",
         confidence_threshold: float = 0.5,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        self.client    = AsyncAnthropic(**kwargs)
+        self.client    = AsyncAnthropic(timeout=45.0, max_retries=1, **kwargs)
         self.model     = model
         self.threshold = confidence_threshold
         # 本地字符 n-gram 向量始终可用；如果未来客户端暴露 embeddings 资源，
@@ -179,6 +180,18 @@ class IntentRecognizer:
 
         history 格式：[{"role": "user"/"assistant", "content": "..."}]
         """
+        from finance.context import resolve_fee_context
+        fee=resolve_fee_context(message,history)
+        if fee.continuation:
+            return IntentResult(IntentCategory.FEE_QUERY,1.0,UrgencyLevel.LOW,
+                                self._intent_group(IntentCategory.FEE_QUERY),self._extract_entities(message),
+                                '继续当前费用咨询，按用户最新补充字段处理',0,{'task_context':1.0})
+        if os.getenv("ECHOMIND_MODE", "demo") == "demo":
+            pat = self._pattern_recognize(message)
+            intent = pat['intent']
+            return IntentResult(intent, pat['confidence'], self._urgency(message,intent),
+                                self._intent_group(intent), self._extract_entities(message),
+                                '演示规则路由（未调用模型）', 0, {'pattern':pat['confidence']})
         key = self._cache_key(message, history)
         if key in self._cache:
             self.cache_hits += 1
@@ -254,7 +267,10 @@ class IntentRecognizer:
 
         prompt = f"""你是客服意图分析专家。根据示例判断用户意图，返回 JSON。
 如果用户问题能匹配细粒度业务意图，请优先返回细粒度意图，而不是宽泛大类。
-例如退款优先返回 refund，发票优先返回 invoice，登录故障优先返回 technical_login。
+产品资料/风险返回 product，费用咨询返回 fee_query，交易进度返回 transaction_status。
+“全部赎回手续费怎么算”是 fee_query，不是操作。
+示例：
+{examples}
 
         {ctx}
         用户消息: "{message}"
@@ -304,26 +320,33 @@ class IntentRecognizer:
     def _pattern_recognize(self, message: str) -> Dict[str, Any]:
         """策略 3：关键词模式匹配（同步，零延迟兜底）。"""
         msg = message.lower()
+        from finance.policy import wants_handoff, operation_requested
+        if re.search(r"SR[A-Z0-9]{6,}", message, re.I):
+            return {"intent":IntentCategory.HUMAN_HANDOFF,"confidence":0.95}
+        if wants_handoff(message):
+            return {"intent":IntentCategory.HUMAN_HANDOFF,"confidence":0.95}
+        if operation_requested(message):
+            return {"intent":IntentCategory.REQUEST,"confidence":0.95}
+        if re.search(r"TX\d+", message, re.I):
+            return {"intent":IntentCategory.TRANSACTION_STATUS,"confidence":0.95}
+        if re.search(r"PAY\d+", message, re.I):
+            return {"intent":IntentCategory.PAYMENT_ISSUE,"confidence":0.95}
         specific_patterns = {
-            IntentCategory.HUMAN_HANDOFF: ["转人工", "人工客服", "找人工"],
-            IntentCategory.ORDER_STATUS: ["订单状态", "发货了吗", "处理到哪", "order status"],
-            IntentCategory.LOGISTICS: ["物流", "快递", "配送", "运单", "delivery", "shipping"],
-            IntentCategory.REFUND: ["退款", "退货", "refund", "return"],
-            IntentCategory.INVOICE: ["发票", "抬头", "税号", "invoice"],
-            IntentCategory.PAYMENT_ISSUE: ["重复扣款", "多扣", "支付失败", "扣费", "payment failed"],
-            IntentCategory.ACCOUNT_SECURITY: ["被盗", "异常登录", "重置密码", "两步验证", "安全"],
-            IntentCategory.TECHNICAL_LOGIN: ["无法登录", "登录失败", "401", "验证码"],
-            IntentCategory.TECHNICAL_CRASH: ["崩溃", "闪退", "500", "报错", "crash"],
+            IntentCategory.FEE_QUERY: ["手续费", "费率", "试算", "申购费用", "赎回费用"],
+            IntentCategory.PAYMENT_ISSUE: ["重复扣款", "扣款", "多扣", "支付失败", "扣费"],
+            IntentCategory.TECHNICAL_LOGIN: ["无法登录", "登录失败", "401", "验证码", "登录"],
+            IntentCategory.TECHNICAL_CRASH: ["崩溃", "闪退", "500", "报错"],
+            IntentCategory.ACCOUNT: ["测评", "评估", "账户状态"],
+            IntentCategory.TRANSACTION_STATUS: ["进度", "确认了吗", "到账了吗"],
+            IntentCategory.REDEMPTION: ["赎回", "申购", "开放日", "开放安排", "到账时间"],
+            IntentCategory.PRODUCT: ["基金", "理财", "产品", "历史收益", "风险", "波动", "流动性", "em00"],
+            IntentCategory.ACCOUNT_SECURITY: ["被盗", "异常登录", "重置密码"],
         }
         generic_patterns = {
-            IntentCategory.ESCALATION: ["投诉", "经理", "supervisor"],
-            IntentCategory.COMPLAINT:  ["太差", "糟糕", "horrible", "等了很久"],
-            IntentCategory.QUERY:      ["?", "？", "怎么", "什么", "status"],
-            IntentCategory.REQUEST:    ["帮我", "需要", "please", "help"],
-            IntentCategory.GREETING:   ["你好", "嗨", "hello", "hi"],
-            IntentCategory.BILLING:    ["退款", "扣款", "发票", "refund"],
-            IntentCategory.TECHNICAL:  ["崩溃", "报错", "error", "crash"],
-            IntentCategory.ACCOUNT:    ["密码", "邮箱", "账户", "password"],
+            IntentCategory.QUERY: ["怎么", "什么", "帮助", "流程", "工单"],
+            IntentCategory.GREETING: ["你好", "您好", "hello"],
+            IntentCategory.ACCOUNT: ["账户", "邮箱", "密码"],
+            IntentCategory.FEEDBACK: ["谢谢", "感谢"],
         }
 
         best_cat, best_score = self._best_pattern_match(msg, specific_patterns)
@@ -343,6 +366,8 @@ class IntentRecognizer:
             "pattern": float(pat.get("confidence", 0.0) or 0.0),
         }
         if llm.get("failed"):
+            if pat.get("intent") != IntentCategory.OTHER and pat.get("confidence", 0) >= 0.5:
+                return pat["intent"], source_scores["pattern"], source_scores
             if emb.get("intent") != IntentCategory.OTHER and emb.get("confidence", 0.0) > 0:
                 return emb["intent"], source_scores["embedding"], source_scores
             if pat.get("intent") != IntentCategory.OTHER and pat.get("confidence", 0.0) > 0:
@@ -354,16 +379,26 @@ class IntentRecognizer:
         else:
             weights = [(llm, 0.85), (pat, 0.15)]
         scores: Dict[IntentCategory, float] = {}
+        group_scores: Dict[IntentCategory, float] = {}
         for result, w in weights:
             cat  = result.get("intent", IntentCategory.OTHER)
             conf = result.get("confidence", 0.0)
-            scores[cat] = scores.get(cat, 0.0) + w * conf
+            weighted_score = w * conf
+            scores[cat] = scores.get(cat, 0.0) + weighted_score
+            group = _INTENT_GROUPS.get(cat, cat)
+            group_scores[group] = group_scores.get(group, 0.0) + weighted_score
 
-        best = max(scores, key=scores.get)  # type: ignore
-        best_score = scores[best]
+        best_group = max(group_scores, key=group_scores.get)
+        best_score = group_scores[best_group]
+        best = max(
+            (cat for cat in scores if _INTENT_GROUPS.get(cat, cat) == best_group),
+            key=scores.get,
+        )
         pat_intent = pat.get("intent", IntentCategory.OTHER)
         pat_conf = float(pat.get("confidence", 0.0) or 0.0)
-        if best in _GENERIC_INTENTS and pat_intent in _SPECIFIC_INTENTS and pat_conf >= 0.5 and best_score < 0.8:
+        if (best in _GENERIC_INTENTS and pat_intent in _SPECIFIC_INTENTS
+                and _INTENT_GROUPS.get(pat_intent, pat_intent) == best_group
+                and pat_conf >= 0.5 and best_score < 0.8):
             source_scores["refined_by_pattern"] = pat_conf
             return pat_intent, max(best_score, pat_conf), source_scores
         if best_score < self.threshold:
@@ -376,8 +411,10 @@ class IntentRecognizer:
         """用规则提取高价值实体，避免每次识别都额外调用 LLM。"""
         message = self._clean_text(message)
         return {
-            "order_id": self._unique(re.findall(r"(?:订单号?|order(?:_id)?|#)\s*[:：#]?\s*([A-Za-z0-9_-]{4,32})", message, re.I)),
-            "product": [],
+            "transaction_id": self._unique(re.findall(r"\bTX\d+\b",message,re.I)),
+            "payment_id": self._unique(re.findall(r"\bPAY\d+\b",message,re.I)),
+            "ticket_id": self._unique(re.findall(r"\bSR[A-Z0-9]{6,}\b",message,re.I)),
+            "product": self._unique(re.findall(r"\bEM\d{3}\b",message,re.I)),
             "date": self._unique(re.findall(r"(今天|明天|昨天|本周|这周|下周|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?)", message)),
             "amount": self._unique(re.findall(r"((?:¥|￥)\s*\d+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?\s*(?:元|块|rmb|cny|usd|美元))", message, re.I)),
             "error_code": self._unique(
@@ -451,7 +488,7 @@ class IntentRecognizer:
         return UrgencyLevel.LOW
 
     def _cache_key(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        payload = {"message": self._clean_text(message)[:200]}
+        payload = {"message": self._clean_text(message)}
         if history:
             payload["history"] = [
                 {

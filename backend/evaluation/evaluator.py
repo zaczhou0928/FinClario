@@ -230,13 +230,13 @@ class EndToEndEvaluator:
         recognizer: IntentRecognizer,
         api_key:  str,
         base_url: Optional[str] = None,
-        model:    str = "claude-3-5-sonnet-20241022",
+        model:    str = "claude-sonnet-4-6",
         baseline_path: Optional[str] = None,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        client = AsyncAnthropic(**kwargs)
+        client = AsyncAnthropic(timeout=45.0, max_retries=1, **kwargs)
 
         self._orchestrator     = orchestrator
         self._judge            = LLMJudge(client, model)
@@ -479,23 +479,14 @@ class EndToEndEvaluator:
 # ── 内置测试用例（开箱即用）──────────────────────────────────────────────────
 
 DEFAULT_INTENT_CASES: List[IntentTestCase] = [
-    IntentTestCase("我的订单什么时候到？",       "logistics"),
-    IntentTestCase("帮我取消订单",               "request"),
-    IntentTestCase("你们服务太差了！",            "complaint"),
-    IntentTestCase("应用一直报500错误",           "technical_crash"),
-    IntentTestCase("为什么扣了两次款？",          "payment_issue"),
-    IntentTestCase("我要投诉，转人工！",          "human_handoff"),
-    IntentTestCase("你好",                        "greeting"),
-    IntentTestCase("修改我的邮箱地址",            "account"),
-    IntentTestCase("帮我开发票",                  "invoice"),
-    IntentTestCase("退款多久到账？",              "refund"),
-    IntentTestCase("登录一直报401",               "technical_login"),
+    IntentTestCase('EM002 风险等级是什么？','product'),
+    IntentTestCase('全部赎回手续费怎么算','fee_query'),
+    IntentTestCase('查询 TX1001 赎回进度','transaction_status'),
+    IntentTestCase('登录报401','technical_login'),
+    IntentTestCase('PAY1001 扣款说明','payment_issue'),
 ]
-
 DEFAULT_DIALOG_CASES: List[Dict[str, Any]] = [
-    {"question": "我的订单 #12345 还没到，已经超时了"},
-    {"question": "应用登录一直报错 401"},
-    {"question": "为什么这个月多扣了 50 块钱？"},
-    {"question": "帮我把收货地址改成北京市朝阳区"},
-    {"turns": ["你好，我想退款", "订单号是 #12345", "退款多久能到账？"]},
+    {'question':'EM002 有哪些风险？','user_id':'u1001'},
+    {'question':'EM002 持有10天，赎回10000元手续费多少？','user_id':'u1001'},
+    {'question':'历史收益代表未来收益吗？','user_id':'u1001'},
 ]
