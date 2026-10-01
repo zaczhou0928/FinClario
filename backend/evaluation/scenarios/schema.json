@@ -1,0 +1,290 @@
+{
+  "$defs": {
+    "Expectation": {
+      "additionalProperties": false,
+      "properties": {
+        "http_status": {
+          "default": 200,
+          "title": "Http Status",
+          "type": "integer"
+        },
+        "required_tools": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Tools",
+          "type": "array"
+        },
+        "forbidden_tools": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Forbidden Tools",
+          "type": "array"
+        },
+        "any_tools": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Any Tools",
+          "type": "array"
+        },
+        "required_doc_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Doc Ids",
+          "type": "array"
+        },
+        "contains": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Contains",
+          "type": "array"
+        },
+        "not_contains": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Not Contains",
+          "type": "array"
+        },
+        "fields": {
+          "title": "Fields",
+          "type": "object"
+        },
+        "tool_results": {
+          "items": {
+            "$ref": "#/$defs/ToolOracle"
+          },
+          "title": "Tool Results",
+          "type": "array"
+        },
+        "ticket_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ticket Count"
+        },
+        "same_ticket": {
+          "default": false,
+          "title": "Same Ticket",
+          "type": "boolean"
+        }
+      },
+      "title": "Expectation",
+      "type": "object"
+    },
+    "RecordChange": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "accounts",
+            "transactions",
+            "payments"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "changes": {
+          "title": "Changes",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "changes"
+      ],
+      "title": "RecordChange",
+      "type": "object"
+    },
+    "Scenario": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "family": {
+          "title": "Family",
+          "type": "string"
+        },
+        "split": {
+          "default": "development",
+          "enum": [
+            "development",
+            "holdout"
+          ],
+          "title": "Split",
+          "type": "string"
+        },
+        "background": {
+          "title": "Background",
+          "type": "string"
+        },
+        "user_goal": {
+          "title": "User Goal",
+          "type": "string"
+        },
+        "user": {
+          "default": "u1001",
+          "enum": [
+            "u1001",
+            "u1002"
+          ],
+          "title": "User",
+          "type": "string"
+        },
+        "reference_docs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Reference Docs",
+          "type": "array"
+        },
+        "initial_records": {
+          "items": {
+            "$ref": "#/$defs/RecordChange"
+          },
+          "title": "Initial Records",
+          "type": "array"
+        },
+        "turns": {
+          "items": {
+            "$ref": "#/$defs/Turn"
+          },
+          "minItems": 1,
+          "title": "Turns",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "family",
+        "background",
+        "user_goal",
+        "reference_docs",
+        "turns"
+      ],
+      "title": "Scenario",
+      "type": "object"
+    },
+    "ToolOracle": {
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "title": "Tool",
+          "type": "string"
+        },
+        "result": {
+          "title": "Result",
+          "type": "object"
+        },
+        "input": {
+          "title": "Input",
+          "type": "object"
+        }
+      },
+      "required": [
+        "tool"
+      ],
+      "title": "ToolOracle",
+      "type": "object"
+    },
+    "Turn": {
+      "additionalProperties": false,
+      "properties": {
+        "message": {
+          "default": "",
+          "title": "Message",
+          "type": "string"
+        },
+        "user": {
+          "anyOf": [
+            {
+              "enum": [
+                "u1001",
+                "u1002"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "User"
+        },
+        "new_conversation": {
+          "default": false,
+          "title": "New Conversation",
+          "type": "boolean"
+        },
+        "replay_previous": {
+          "default": false,
+          "title": "Replay Previous",
+          "type": "boolean"
+        },
+        "before": {
+          "items": {
+            "$ref": "#/$defs/RecordChange"
+          },
+          "title": "Before",
+          "type": "array"
+        },
+        "expect": {
+          "$ref": "#/$defs/Expectation"
+        }
+      },
+      "required": [
+        "expect"
+      ],
+      "title": "Turn",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "title": "Version",
+      "type": "string"
+    },
+    "provenance": {
+      "title": "Provenance",
+      "type": "string"
+    },
+    "reference_date": {
+      "title": "Reference Date",
+      "type": "string"
+    },
+    "cases": {
+      "items": {
+        "$ref": "#/$defs/Scenario"
+      },
+      "minItems": 1,
+      "title": "Cases",
+      "type": "array"
+    }
+  },
+  "required": [
+    "version",
+    "provenance",
+    "reference_date",
+    "cases"
+  ],
+  "title": "Dataset",
+  "type": "object"
+}
