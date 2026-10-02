@@ -20,7 +20,9 @@ def now():
 
 
 def sanitize(text):
-    text = re.sub(r'(?<!\d)\d{11,19}(?!\d)', '[已隐去长号码]', str(text))
+    # 先完整识别系统生成的工单号，避免其数字片段被误当作私人长号码。
+    pattern = r'(?<![A-Za-z0-9])SR[A-F0-9]{12}(?![A-Za-z0-9])|(?<!\d)\d{11,19}(?!\d)'
+    text = re.sub(pattern, lambda m: m[0] if m[0].upper().startswith('SR') else '[已隐去长号码]', str(text), flags=re.I)
     return re.sub(r'(密码|验证码|口令)\s*[:：是]?\s*[A-Za-z0-9]{4,}', r'\1[已隐去]', text)
 
 
